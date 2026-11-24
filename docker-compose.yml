@@ -1,0 +1,88 @@
+# Production-style stack: MySQL + Redis + Flask API (gunicorn) + scheduler + nginx (static app + /api proxy).
+#   cp .env.production.example .env   # then fill in real secrets
+#   docker compose up -d --build
+# TLS is terminated in front of the `web` service (load balancer / Caddy / Cloudflare). See docs/DEPLOYMENT.md.
+name: aifp
+
+x-backend-env: &backend-env
+  APP_ENV: ${APP_ENV:-production}
+  SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY in .env}
+  JWT_SECRET_KEY: ${JWT_SECRET_KEY:?set JWT_SECRET_KEY in .env}
+  DATABASE_URL: mysql+pymysql://${MYSQL_USER}:${MYSQL_PASSWORD}@db:3306/${MYSQL_DATABASE}?charset=utf8mb4
+  RATELIMIT_STORAGE_URI: redis://redis:6379/0
+  CORS_ORIGINS: ${PUBLIC_URL:?set PUBLIC_URL in .env}
+  FRONTEND_URL: ${PUBLIC_URL}
+  TRUST_PROXY_HOPS: "1"
+  PAYMENT_PROVIDER: ${PAYMENT_PROVIDER:-mock}
+  MOCK_PAYMENTS_ENABLED: ${MOCK_PAYMENTS_ENABLED:-false}
+  ALLOW_INSECURE_MOCK_PAYMENTS: ${ALLOW_INSECURE_MOCK_PAYMENTS:-false}
+  PAYMENT_WEBHOOK_SECRET: ${PAYMENT_WEBHOOK_SECRET:?set PAYMENT_WEBHOOK_SECRET in .env}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  AI_MODEL: ${AI_MODEL:-claude-opus-5-5}
+  AI_DAILY_MESSAGE_LIMIT: ${AI_DAILY_MESSAGE_LIMIT:-50}
+  SENTRY_DSN: ${SENTRY_DSN:-}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  CHAT_RETENTION_DAYS: ${CHAT_RETENTION_DAYS:-365}
+
+services:
+  db:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_0900_ai_ci", "--log-bin-trust-function-creators=1"]
+    volumes:
+      - dbdata:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]   # rate-limit counters only; safe to lose
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 20
+
+  migrate:                      # one-shot: applies migrations, then exits (so replicas never race on schema changes)
+    build: ./backend
+    command: ["flask", "db", "upgrade"]
+    environment: *backend-env
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    restart: "no"
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    environment: *backend-env
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    expose: ["8000"]
+
+  scheduler:                    # credit expiry/grants, subscription + consultation upkeep, retention. All jobs are idempotent.
+    build: ./backend
+    restart: unless-stopped
+    command: ["sh", "-c", "while true; do flask run-jobs; sleep ${SCHEDULER_SECONDS:-300}; done"]
+    environment: *backend-env
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  web:
+    build: ./frontend
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-8080}:8080"
+    depends_on:
+      - backend
+
+volumes:
+  dbdata:
